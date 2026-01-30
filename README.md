@@ -26,4 +26,4 @@ Welcome to the Mc-special-edition repository!
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to upload files and contribute to this project.
 
-Molimo pročitajte [CONTRIBUTING.md](CONTRIBUTING.md) za detalje o tome kako upload-ovati fajlove i doprineti ovom projektu.
+Molimo pročitajte [CONTRIBUTING.md](CONTRIBUTING.md) za detalje o tome kako Upload-ovati fajlove i doprineti ovom projektu.
