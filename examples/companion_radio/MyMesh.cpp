@@ -2,6 +2,69 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
+#include <CayenneLPP.h>
+#include <ctime>
+#include <string>
+#include <helpers/sensors/LPPDataHelpers.h>
+
+struct EnvSnapshot {
+  bool hasTemp = false;
+  bool hasHumidity = false;
+  bool hasPressure = false;
+  float tempC = 0;
+  float humidityPct = 0;
+  float pressureHpa = 0;
+};
+
+static EnvSnapshot collectEnvSnapshot(EnvironmentSensorManager& sensors) {
+  EnvSnapshot env{};
+  CayenneLPP lpp(64);
+  sensors.querySensors(TELEM_PERM_ENVIRONMENT, lpp);
+
+  LPPReader reader(lpp.getBuffer(), lpp.getSize());
+  uint8_t channel, type;
+  while (reader.readHeader(channel, type)) {
+    switch (type) {
+      case LPP_TEMPERATURE: {
+        float v;
+        if (reader.readTemperature(v)) {
+          env.tempC = v;
+          env.hasTemp = true;
+        }
+        break;
+      }
+      case LPP_RELATIVE_HUMIDITY: {
+        float v;
+        if (reader.readRelativeHumidity(v)) {
+          env.humidityPct = v;
+          env.hasHumidity = true;
+        }
+        break;
+      }
+      case LPP_BAROMETRIC_PRESSURE: {
+        float v;
+        if (reader.readPressure(v)) {
+          env.pressureHpa = v;
+          env.hasPressure = true;
+        }
+        break;
+      }
+      default:
+        reader.skipData(type);
+    }
+  }
+
+  return env;
+}
+
+static bool isPrintableText(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    uint8_t c = data[i];
+    if (c == '\n' || c == '\r' || c == '\t') continue;
+    if (c < 0x20 || c > 0x7E) return false;
+  }
+  return true;
+}
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -622,17 +685,94 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
   } else if (len > 4 && // check for status response
              pending_status &&
              memcmp(&pending_status, contact.id.pub_key, 4) == 0 // legacy matching scheme
-                                                                 // FUTURE: tag == pending_status
+                                                                  // FUTURE: tag == pending_status
   ) {
     pending_status = 0;
+
+    const uint8_t* status_payload = &data[4];
+    uint8_t status_len = len - 4;
 
     int i = 0;
     out_frame[i++] = PUSH_CODE_STATUS_RESPONSE;
     out_frame[i++] = 0; // reserved
     memcpy(&out_frame[i], contact.id.pub_key, 6);
     i += 6; // pub_key_prefix
-    memcpy(&out_frame[i], &data[4], len - 4);
-    i += (len - 4);
+
+    size_t payload_budget = (MAX_FRAME_SIZE > i) ? (MAX_FRAME_SIZE - i) : 0;
+    if (payload_budget == 0) return;
+
+    if (isPrintableText(status_payload, status_len)) {
+      std::string body(reinterpret_cast<const char*>(status_payload), status_len);
+      std::string decorated;
+
+      // Build prefix with time/battery/environment
+      decorated.reserve(body.size() + 64);
+
+      time_t now = getRTCClock()->getCurrentTime();
+      struct tm tm_now;
+      localtime_r(&now, &tm_now);
+      char line[32];
+
+      snprintf(line, sizeof(line), "%02d:%02d:%02d", tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+      decorated += "🕐 ";
+      decorated += line;
+      decorated += "\n";
+
+      float batt_v = (float)board.getBattMilliVolts() / 1000.0f;
+      snprintf(line, sizeof(line), "%.2fV", batt_v);
+      decorated += "🔋 ";
+      decorated += line;
+      decorated += "\n";
+
+      EnvSnapshot env = collectEnvSnapshot(sensors);
+      if (env.hasTemp) {
+        snprintf(line, sizeof(line), "%.1f°C", env.tempC);
+        decorated += "🌡️ ";
+        decorated += line;
+        decorated += "\n";
+      }
+      if (env.hasHumidity) {
+        snprintf(line, sizeof(line), "%.0f%%", env.humidityPct);
+        decorated += "💧 ";
+        decorated += line;
+        decorated += "\n";
+      }
+      if (env.hasPressure) {
+        snprintf(line, sizeof(line), "%.0fhPa", env.pressureHpa);
+        decorated += "📊 ";
+        decorated += line;
+        decorated += "\n";
+      }
+
+      decorated += "---\n";
+      decorated += "⚙️ stanje\n";
+
+      const char* gpio_icon = "🔌 ";
+      size_t start = 0;
+      while (start <= body.size()) {
+        size_t end = body.find('\n', start);
+        std::string line_body = body.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line_body.empty()) {
+          decorated += gpio_icon;
+          decorated += line_body;
+        }
+        if (end == std::string::npos) break;
+        decorated += "\n";
+        start = end + 1;
+      }
+
+      if (decorated.size() > payload_budget) {
+        decorated.resize(payload_budget);
+      }
+
+      memcpy(&out_frame[i], decorated.data(), decorated.size());
+      i += decorated.size();
+    } else {
+      if (status_len > payload_budget) status_len = payload_budget;
+      memcpy(&out_frame[i], status_payload, status_len);
+      i += status_len;
+    }
+
     _serial->writeFrame(out_frame, i);
   } else if (len > 4 && tag == pending_telemetry) {  // check for matching response tag
     pending_telemetry = 0;
